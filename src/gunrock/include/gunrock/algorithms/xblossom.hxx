@@ -1,0 +1,948 @@
+/**
+ * @file xblossom.hxx
+ * @brief X-Blossom++ (maximum matching in general graphs) on Gunrock.
+ *
+ * The algorithm is XB++'s (X-Blossom repo, src/xblsm_gpu/xb_gpu_engine.cu,
+ * XB_REUSE=1): search phases grow alternating trees from the exposed nodes;
+ * each iteration of a phase runs
+ *   1. augment  -- an edge between even nodes of two trees is an augmenting
+ *                  path; lock both trees and flip it in the matching
+ *   2. expand   -- a neighbour w in no tree joins as an odd node and its mate
+ *                  as an even node
+ *   3. blossom  -- an edge between even nodes of one tree closes a blossom
+ *                  whose odd nodes then become even
+ * until a path is found (next phase) or no even node is left (maximum).
+ * Trees whose root is still exposed are kept across phases.
+ *
+ * What Gunrock does here: each step's frontier (the even nodes of the
+ * X-Blossom node queue) goes into a gunrock frontier_t and the three steps are
+ * advance operators with load balancing LB (block_mapped = Gunrock's default,
+ * or thread_mapped); the two per-vertex initialisation passes are
+ * parallel_for. What stays X-Blossom's own (vendored, ./xblossom/): the
+ * device path table, the even-node queue, the per-tree / per-match /
+ * per-odd-node locks and the blossom transform. One semantic difference from
+ * the hand-written XB++ node-level mode: the advance lambda sees one edge at a
+ * time, so there is no "skip this node's remaining edges".
+ */
+#pragma once
+
+#include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
+
+#include <cub/cub.cuh>
+#include <thrust/functional.h>
+#include <thrust/transform_reduce.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+// X-Blossom's device structures (vendored; the example adds
+// include/gunrock/algorithms/xblossom to the include path).
+#include "utils/utils_gpu.h"
+#include "utils/dev_array.h"
+#include "utils/dev_value.h"
+#include "utils/dev_list.h"
+#include "utils/stream.h"
+#include "utils/launcher.h"
+#include "utils/cuda_algo.h"
+#include "enode_queue/enode_queue.h"
+#include "path_table/path_table.h"
+#include "path_table/path_table_tuple.h"
+#include <type_traits>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <chrono>
+
+namespace gunrock {
+namespace xblossom {
+
+// Size of the blossom lists, per node (XB++'s ODD_NODE_RATIO).
+constexpr size_t kOddNodeRatio = 30; // default capacity of the blossom lists, per node
+
+// nomat: walk even node s's chain down to the blossom base and claim every
+// odd node still odd (per-node lock); each claim is one transform task
+// (node, s, o, base), the node becoming even with the path around the cycle
+// through o. Same as X-Blossom++'s ClaimOddNodesOnChain (xb_gpu_engine.cu).
+template <typename path_table_t, typename flags_t, typename list_t, typename array_t>
+__device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, flags_t& is_even,
+                                                     flags_t& atomic_locks_odd_nodes, list_t& task_node,
+                                                     array_t& task_s, array_t& task_o, array_t& task_base,
+                                                     index_t s, index_t o, index_t base) {
+  path_table.ForEachRecordedOddOnChain(s, base, [&](index_t n) {
+    if (!is_even[n] && TryClaimDAtomicFlag(&atomic_locks_odd_nodes[n])) {  // XB-GAP's TryClaim
+      const offset_t t = task_node.Append(n);
+      if (static_cast<size_t>(t) >= task_node.capacity()) return; // the list is full; the host stops the run
+      task_s[t] = s;
+      task_o[t] = o;
+      task_base[t] = base;
+    }
+  });
+}
+
+// path_table_t: zblossom::dev::TuplePathTable (the compact path table, three
+// vertex ids per node; the default) or zblossom::dev::PathTable (the segment
+// path table). Both run mat and nomat; mat on the compact table materialises
+// the cycles from the records (TuplePathTableView::MaterializeCycle).
+template <operators::load_balance_t LB, typename graph_t, typename path_table_t = zblossom::dev::PathTable>
+class engine_t {
+  static constexpr bool kTuple = std::is_same<path_table_t, zblossom::dev::TuplePathTable>::value;
+  using vertex_t = typename graph_t::vertex_type;
+  using edge_t = typename graph_t::edge_type;
+  using weight_t = typename graph_t::weight_type;
+  using frontier_t = frontier::frontier_t<vertex_t, edge_t, frontier::frontier_kind_t::vertex_frontier>;
+
+ public:
+  // nomat: no blossom buffer, odd nodes claimed while the closing edge walks
+  // its chains and made even from the path table (X-Blossom++'s XB_BLOSSOM_MAT 1);
+  // odd_node_ratio sizes the blossom lists (records under mat, tasks under nomat),
+  // in entries per node; it may be fractional (nomat needs well under one per node).
+  // path_table_buffer_ratio sizes the cycle buffer (mat), segment_buffer_ratio
+  // the segment table's buffer (-T segment); both x n nodes.
+  // base_rootpath (segment table, mat only): find each blossom's base as the
+  // original X-Blossom does, by materialising both endpoint-to-root paths and
+  // scanning them from the root; otherwise on the fly, by the two anchor walks.
+  engine_t(graph_t& G, size_t path_table_buffer_ratio, size_t segment_buffer_ratio, double odd_node_ratio, bool nomat,
+           std::shared_ptr<gcuda::multi_context_t> context, bool base_rootpath = false)
+      : G_(G),
+        context_(context),
+        nomat_(nomat),
+        base_rootpath_(base_rootpath),
+        nnodes_(G.get_number_of_vertices()),
+        dev_matching_(nnodes_, nnodes_),
+        path_table_(nnodes_, path_table_buffer_ratio, segment_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
+        is_even_(nnodes_),
+        tree_roots_(nnodes_),
+        atomic_locks_tree_(nnodes_),
+        atomic_locks_match_(nnodes_),
+        atomic_locks_odd_nodes_(nnodes_),
+        enode_queue_(nnodes_),
+        blossom_offset_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_nodes_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_vside_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_in_blossom_psum_(nomat ? 1 : ListSize(odd_node_ratio, nnodes_)), // nomat scans nothing,
+        input_frontier_(nnodes_),
+        output_frontier_(1) {
+    size_t bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, num_odd_nodes_in_blossom_list_.begin(),
+                                             num_odd_nodes_in_blossom_psum_.begin(),
+                                             static_cast<int>(num_odd_nodes_in_blossom_psum_.size()),
+                                             cuda_stream_.cuda_stream()));
+    scan_temp_.resize(bytes);
+    scan_temp_bytes_ = bytes;
+    if (gacge::lb::enabled()) {
+      lb_merge_.item_sync = 1;  // merge_path's per-item warp sync (gacge_lb.hxx item_sync_env)
+      lb_merge_.reserve(nnodes_);
+      lb_merge_.reserve_work((long long)nnodes_ + G.get_number_of_edges());
+    }
+  }
+
+  // entries of a blossom list: ratio x n, rounded up, plus the one a prefix sum needs
+  static size_t ListSize(double ratio, size_t n) { return static_cast<size_t>(std::ceil(ratio * static_cast<double>(n))) + 1; }
+
+  // Maximum matching from the empty matching; mate[v] == nnodes for exposed v.
+  // Maximum matching from the empty matching: PrepareMatch, Match, Mate. The
+  // driver times Match only (GACGE): the empty matching is set before, and the
+  // mates copied back after, its timer, as Gunrock's enactors time their loop
+  // after the problem's reset.
+  std::vector<index_t> FindMaximumMatch() {
+    PrepareMatch();
+    Match();
+    return Mate();
+  }
+
+  // Untimed: the statistics' and counters' reset and the empty matching.
+  void PrepareMatch() {
+    // GACGE traversal statistics (measure/traversal-char), off unless
+    // GACGE_TRAVERSAL_STATS is set: one XBTraversal line per matching, and one
+    // XBStep line per advance for the matching numbered GACGE_TRAVERSAL_TRACE
+    // (0-based, default 1: the first after one warm-up).
+    static int run_index = -1;
+    ++run_index;
+    ts_on_ = std::getenv("GACGE_TRAVERSAL_STATS") != nullptr;
+    const char* trace_env = std::getenv("GACGE_TRAVERSAL_TRACE");
+    ts_trace_ = ts_on_ && run_index == (trace_env ? std::atoi(trace_env) : 1);
+    ts_run_ = run_index;
+    for (int k = 0; k < 3; k++) ts_steps_[k] = ts_v_[k] = ts_e_[k] = 0;
+    ts_max_e_ = ts_small_ = 0;
+    ts_imb_sum_ = 0;
+    ts_imb_n_ = 0;
+    if constexpr (kTuple) {
+      path_table_.EnableCounters(ts_on_ || SearchStats());
+      path_table_.ResetCounters();
+    }
+    dev_matching_.Fill(static_cast<index_t>(nnodes_));
+    cudaDeviceSynchronize();
+  }
+
+  // GACGE_XB_SEARCHES=1: one XBSearch line per search of the first matching
+  // (its steps, the augmenting paths it found, and the augment claims that
+  // took the first tree, failed on the second and released the first).
+  static bool SearchStats() {
+    static const bool on = std::getenv("GACGE_XB_SEARCHES") != nullptr;
+    return on;
+  }
+
+  // Timed: the searches, from the empty matching to the maximum one.
+  void Match() {
+    const bool stats = SearchStats() && ts_run_ == 0;
+    size_t search_index = 0;
+    auto search = [&]() {
+      const size_t steps0 = steps_;
+      unsigned long long paths0 = 0;
+      if constexpr (kTuple) {
+        if (stats) paths0 = path_table_.AugmentingPaths();
+      }
+      if (stats) dev_conflicts_.SetH2D(0);
+      FindAndFlipAugmentingPath();
+      if (stats) {
+        unsigned long long paths = 0;
+        if constexpr (kTuple) paths = path_table_.AugmentingPaths() - paths0;
+        std::printf("XBSearch: index=%zu steps=%zu paths=%llu claim_conflicts=%llu\n", search_index++,
+                    steps_ - steps0, paths, dev_conflicts_.GetD2H());
+      }
+    };
+    found_ = DFLAG_FALSE;
+    size_t searches = 1;
+    search();
+    while (found_ == DFLAG_TRUE) {
+      found_ = DFLAG_FALSE;
+      search();
+      searches++;
+    }
+    if (StepTimes()) {
+      for (const auto& r : step_times_)
+        std::printf("XBStepTime: run=%d step=%zu kind=%s n=%lld e=%lld blocks=%lld ms=%.4f\n", ts_run_, r.step, r.phase,
+                    r.n, r.e, r.blocks, r.ms);
+      step_times_.clear();
+    }
+    if (ts_on_) {
+      size_t steps = 0, fv = 0, fe = 0;
+      for (int k = 0; k < 3; k++) { steps += ts_steps_[k]; fv += ts_v_[k]; fe += ts_e_[k]; }
+      unsigned long long walks = 0, walk_steps = 0, paths = 0, flips = 0, direct = 0, max_flips = 0;
+      if constexpr (kTuple) {
+        walks = path_table_.BaseWalks();
+        walk_steps = path_table_.BaseWalkSteps();
+        paths = path_table_.AugmentingPaths();
+        flips = path_table_.AugmentingPathFlips();
+        direct = path_table_.DirectAugmentingPaths();
+        max_flips = path_table_.MaxAugmentingPathFlips();
+      }
+      std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
+                  "imbalance=%.3f nodes=%zu edges=%zu searches=%zu aug_steps=%zu aug_e=%zu expand_steps=%zu "
+                  "expand_e=%zu blossom_steps=%zu blossom_e=%zu base_walks=%llu base_walk_steps=%llu "
+                  "aug_paths=%llu aug_path_flips=%llu aug_paths_direct=%llu aug_path_max_flips=%llu\n",
+                  ts_run_, steps, fv, fe, ts_max_e_, ts_small_, ts_imb_n_ ? ts_imb_sum_ / ts_imb_n_ : 0.0, nnodes_,
+                  (size_t)G_.get_number_of_edges(), searches, ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1],
+                  ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips, direct, max_flips);
+    }
+    if (gacge::task::enabled()) {
+      const unsigned long long long_tasks = task_walk_.tasks() + task_flip_.tasks();
+      task_all_.add(task_fe_ > long_tasks ? task_fe_ - long_tasks : 0ULL, 1);  // the plain edge checks
+      task_all_.print("X-Blossom", "frontier-edge");
+      task_walk_.print("X-Blossom", "closing-edge");
+      task_flip_.print("X-Blossom", "augmenting-edge");
+      task_fe_ = 0;
+    }
+    cudaDeviceSynchronize();
+  }
+
+  // Untimed: the mates copied back to the host.
+  std::vector<index_t> Mate() {
+    std::vector<index_t> mate(nnodes_);
+    thrust::copy(dev_matching_.begin(), dev_matching_.end(), mate.begin());
+    return mate;
+  }
+
+  // Accumulated phase times (s) and step count of the matching so far
+  void PhaseSeconds(double& aug_path_s, double& expand_s, double& blossom_s) const {
+    aug_path_s = t_aug_;
+    expand_s = t_expand_;
+    blossom_s = t_blossom_;
+  }
+  double InitSeconds() const { return t_init_; }
+  size_t Steps() const { return steps_; }
+  // Memory footprint of the blossom phase: the most nodes the blossom buffer
+  // held in a step (mat only), the most entries the blossom lists held in a
+  // step (closing-edge records under mat, odd-node tasks under nomat), the
+  // path segments written, and the capacities
+  size_t PeakBlossomBufferNodes() const { return peak_buffer_; }
+  size_t PeakBlossomListEntries() const { return peak_list_; }
+  size_t PeakTransformTasks() const { return peak_tasks_; }
+  size_t PathsUsed() const { return path_table_.PathsUsed(); }
+  size_t BufferCapacity() const { return path_table_.BufferCapacity(); }
+  size_t PathTableFixedBytes() const { return path_table_.FixedBytes(); }
+  int FlipStackPeak() const { return path_table_.FlipStackPeak(); }
+  size_t BlossomListCapacity() const { return num_odd_nodes_in_blossom_list_.size(); }
+  // Counters (EnableCounters, driver -c 1): blossoms, counted as the closing edges whose
+  // base was identified (one record per closing edge under mat, one base walk under nomat)
+  void EnableCounters() { count_ = true; }
+  size_t Blossoms() const { return blossoms_; }
+
+  // Public: nvcc requires the enclosing function of an extended __device__
+  // lambda to be public.
+  graph_t& G_;
+  std::shared_ptr<gcuda::multi_context_t> context_;
+  bool nomat_;
+  bool base_rootpath_;
+  size_t nnodes_;
+  double t_aug_{0}, t_expand_{0}, t_blossom_{0}, t_init_{0};
+  size_t steps_{0}, peak_buffer_{0}, peak_list_{0}, peak_tasks_{0};
+  bool count_{false};
+  size_t blossoms_{0};
+  int found_{DFLAG_FALSE};
+  int exhausted_{DFLAG_FALSE};
+
+  DArray<index_t> dev_matching_;
+  DValue<DFlag> dev_found_;
+  DValue<unsigned long long> dev_blossoms_; // counter builds: closing edges of this step (nomat)
+  DValue<unsigned long long> dev_conflicts_; // GACGE_XB_SEARCHES: augment claims released this search
+  path_table_t path_table_;
+  DArray<DFlag> is_even_;
+  DArray<index_t> tree_roots_;
+  DArray<DAtomicFlag> atomic_locks_tree_;
+  DArray<DAtomicFlag> atomic_locks_match_;
+  DArray<DAtomicFlag> atomic_locks_odd_nodes_;
+  zblossom::ENodeQueue enode_queue_;
+
+  DList<offset_t> blossom_offset_list_; // cycle offsets (mat) or odd-node tasks (nomat)
+  DArray<index_t> num_nodes_in_blossom_list_;
+  DArray<index_t> num_odd_nodes_vside_in_blossom_list_;
+  DArray<index_t> num_odd_nodes_in_blossom_list_;
+  DArray<offset_t> num_odd_nodes_in_blossom_psum_; // 64-bit: a step's odd-node tasks can exceed 2^31
+
+  CudaStream cuda_stream_;
+  DVector<char> scan_temp_;
+  size_t scan_temp_bytes_{0};
+
+  frontier_t input_frontier_;
+  frontier_t output_frontier_;  // unused: the advances write no output frontier
+  gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
+  thrust::device_vector<edge_t> segments_;
+
+  gacge::task::stats_t task_all_, task_walk_, task_flip_, task_step_, task_thr_;  // GACGE_TASK_STATS
+  // GACGE_TASK_STATS, per blossom step: warp-level executions and thread-level ones
+  // (lanes executing together) of the op's entry and its closing branch (lane_op_:
+  // extra 0..3), of the base walk's and the chain scans' loop bodies (lane_loop_)
+  gacge::task::stats_t lane_op_, lane_loop_;
+  size_t blossom_step_{0};                                             // the blossom steps printed
+  unsigned long long task_fe_{0};                          // the frontier edges of the run's advances
+
+  // GACGE_XB_CLAIM: the augment step's tree claims. gap: XB-GAP's protocol (a
+  // thread meeting a held tree gives up). tentative: a thread waits out a
+  // tentative holder of its first tree. tentative2 (default since 2026-10-16):
+  // of its second tree as well. On the eight graphs tentative2 cut the
+  // searches by 28-42% (a tree whose claimant lost the second lock is no
+  // longer left unpaired for the search); GACGE_XB_CLAIM_SPIN (default 64):
+  // the bound on each wait (types_gpu.h ClaimTreeWait).
+  static int ClaimMode() {
+    static const int m = [] {
+      const char* e = std::getenv("GACGE_XB_CLAIM");
+      if (e == nullptr) return 2;
+      const std::string s = e;
+      return s == "tentative2" ? 2 : s == "tentative" ? 1 : 0;
+    }();
+    return m;
+  }
+  static int ClaimSpin() {
+    static const int n = [] {
+      const char* e = std::getenv("GACGE_XB_CLAIM_SPIN");
+      return e ? std::atoi(e) : 64;
+    }();
+    return n;
+  }
+
+  // GACGE_XB_PHASE_SYNC (default 1): a device synchronization at the end of
+  // init, expand and blossom, so each phase's host-clock time holds its own
+  // kernels (augment already ends with the found flag copied back). 0: no
+  // extra synchronization; expand's kernels then run into blossom's time.
+  static bool PhaseSync() {
+    static const bool on = [] {
+      const char* e = std::getenv("GACGE_XB_PHASE_SYNC");
+      return e == nullptr || e[0] != '0';
+    }();
+    return on;
+  }
+
+  // GACGE_STEP_TIMES (as the enactor's, framework/enactor.hxx): one XBStepTime line per phase of every
+  // step after the matching: its frontier vertices, edges and merge-path blocks (lb_merge_'s plan, 128
+  // threads a block) and its time on the GPU timeline (host clock; the phases end synchronized, so the
+  // time holds the phase's kernels and the host work around them). init: the per-search reset over every
+  // vertex. Recorded in memory, printed after the searches.
+  static bool StepTimes() {
+    static const bool on = std::getenv("GACGE_STEP_TIMES") != nullptr;
+    return on;
+  }
+  struct step_time_t {
+    size_t step;
+    const char* phase;
+    long long n, e, blocks;
+    double ms;
+  };
+  std::vector<step_time_t> step_times_;
+  size_t adv_calls_{0};  // advances run (a phase with an empty queue runs none)
+  void RecordStep(const char* phase, size_t adv0, double s) {
+    const bool ran = adv_calls_ != adv0;
+    step_times_.push_back({steps_, phase, ran ? (long long)input_frontier_.get_number_of_elements() : 0,
+                           ran ? lb_merge_.last_nnz : 0, ran ? lb_merge_.tiles : 0, 1e3 * s});
+  }
+
+  void FindAndFlipAugmentingPath() {
+    using clock = std::chrono::high_resolution_clock;
+    auto secs = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    const bool sync = PhaseSync();
+    const bool st = StepTimes();
+    auto ti = clock::now();
+    InitAlternatingForest();
+    if (sync) cudaDeviceSynchronize();
+    t_init_ += secs(ti, clock::now());
+    if (st) step_times_.push_back({steps_, "init", (long long)nnodes_, 0, -1, 1e3 * secs(ti, clock::now())});
+    while (true) {
+      auto ta = clock::now();
+      if (IsExhausted()) break;
+      auto t0 = clock::now();
+      size_t a0 = adv_calls_;
+      bool found = FindAndFlipAugmentingPathInAlternatingForest();
+      auto t1 = clock::now();
+      t_aug_ += secs(t0, t1);
+      if (st) RecordStep("augment", a0, secs(ta, t1));
+      if (found) break;
+      a0 = adv_calls_;
+      ExpandAlternatingForest();
+      if (sync) cudaDeviceSynchronize();
+      auto t2 = clock::now();
+      t_expand_ += secs(t1, t2);
+      if (st) RecordStep("expand", a0, secs(t1, t2));
+      a0 = adv_calls_;
+      TransformOddNodesInBlossom();
+      if (sync) cudaDeviceSynchronize();
+      auto t3 = clock::now();
+      t_blossom_ += secs(t2, t3);
+      if (st) RecordStep("blossom", a0, secs(t2, t3));
+      steps_++;
+    }
+  }
+
+  bool IsExhausted() {
+    if (enode_queue_.Size() == 0) exhausted_ = DFLAG_TRUE;
+    return exhausted_;
+  }
+
+  // The even nodes of the queue (the current step's frontier) as a gunrock
+  // frontier; returns its size.
+  size_t LoadFrontier() {
+    const index_t begin = enode_queue_.Begin();
+    const size_t size = enode_queue_.End() - begin;
+    if (input_frontier_.get_capacity() < size) input_frontier_.reserve(size);
+    input_frontier_.set_number_of_elements(size);
+    thrust::copy(thrust::device, enode_queue_.BeginIterator() + begin,
+                 enode_queue_.BeginIterator() + begin + size, input_frontier_.begin());
+    return size;
+  }
+
+  // GACGE traversal statistics: per phase (0 AugPath, 1 Expand, 2 Blossom)
+  bool ts_on_{false}, ts_trace_{false};
+  int ts_run_{0}, ts_phase_{0};
+  size_t ts_steps_[3]{0, 0, 0}, ts_v_[3]{0, 0, 0}, ts_e_[3]{0, 0, 0}, ts_max_e_{0}, ts_small_{0};
+  double ts_imb_sum_{0};  // sum over steps of max degree / mean degree of the frontier
+  size_t ts_imb_n_{0};
+
+  // The loaded frontier's vertices and the edges the advance will examine (their degrees)
+  void TraversalStep() {
+    const size_t n = input_frontier_.get_number_of_elements();
+    size_t fe = 0, max_deg = 0;
+    if (n > 0) {
+      auto g = G_;
+      auto first = input_frontier_.begin();
+      auto deg = [g] __device__(vertex_t const& v) -> size_t { return (size_t)g.get_number_of_neighbors(v); };
+      fe = thrust::transform_reduce(thrust::device, first, first + n, deg, size_t(0), thrust::plus<size_t>());
+      max_deg = thrust::transform_reduce(thrust::device, first, first + n, deg, size_t(0), thrust::maximum<size_t>());
+    }
+    if (fe > 0) {
+      ts_imb_sum_ += (double)max_deg * (double)n / (double)fe;
+      ts_imb_n_++;
+    }
+    const int k = ts_phase_;
+    ts_steps_[k]++;
+    ts_v_[k] += n;
+    ts_e_[k] += fe;
+    ts_max_e_ = fe > ts_max_e_ ? fe : ts_max_e_;
+    ts_small_ += fe < 65536;
+    if (ts_trace_) {
+      static const char* names[3] = {"augpath", "expand", "blossom"};
+      std::printf("XBStep: run=%d step=%zu phase=%s frontier_v=%zu frontier_e=%zu max_deg=%zu\n", ts_run_,
+                  ts_steps_[0] + ts_steps_[1] + ts_steps_[2] - 1, names[k], n, fe, max_deg);
+    }
+  }
+
+  // GACGE_TASK_STATS: Advance with each thread's work added up and recorded (-l gacge)
+  template <typename op_t>
+  void AdvanceCount(op_t op, gacge::task::view_t v) {
+    adv_calls_++;
+    if (ts_on_) TraversalStep();
+    const size_t n = input_frontier_.get_number_of_elements();
+    if (n > 0) {
+      auto g = G_;
+      auto first = input_frontier_.begin();
+      task_fe_ += thrust::transform_reduce(
+          thrust::device, first, first + n,
+          [g] __device__(vertex_t const& x) -> unsigned long long { return (unsigned long long)g.get_number_of_neighbors(x); },
+          0ULL, thrust::plus<unsigned long long>());
+    }
+    gacge::lb::advance_count(gacge::lb::mode(gacge::lb::mode_t::merge), G_, op, input_frontier_.data(), (long long)n,
+                             lb_merge_, context_->get_context(0)->stream(), v);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+
+  // One advance over the loaded frontier with LB; op returns false (no output).
+  template <typename op_t>
+  void Advance(op_t op) {
+    adv_calls_++;
+    if (ts_on_) TraversalStep();
+    if (gacge::task::enabled()) {  // every frontier edge is a task; the plain checks are added up at the end
+      const size_t n = input_frontier_.get_number_of_elements();
+      if (n > 0) {
+        auto g = G_;
+        auto first = input_frontier_.begin();
+        task_fe_ += thrust::transform_reduce(
+            thrust::device, first, first + n,
+            [g] __device__(vertex_t const& v) -> unsigned long long { return (unsigned long long)g.get_number_of_neighbors(v); },
+            0ULL, thrust::plus<unsigned long long>());
+      }
+    }
+    if (gacge::lb::enabled()) {  // the schedule GACGE_LB of every GACGE primitive (gacge_lb.hxx)
+      gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::merge), G_, op, input_frontier_.data(),
+                         (long long)input_frontier_.get_number_of_elements(), lb_merge_,
+                         context_->get_context(0)->stream());
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+      return;
+    }
+    operators::advance::execute<LB, operators::advance_direction_t::forward,
+                                operators::advance_io_type_t::vertices, operators::advance_io_type_t::none>(
+        G_, op, &input_frontier_, &output_frontier_, segments_, *context_);
+    // merge_path launches without synchronizing (block_mapped does) and a
+    // failed launch would otherwise go unnoticed; the next step reads results
+    // on the host.
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+
+  void InitAlternatingForest() {
+    atomic_locks_tree_.Fill(DFLAG_FALSE);
+    atomic_locks_match_.Fill(DFLAG_FALSE);
+    atomic_locks_odd_nodes_.Fill(DFLAG_FALSE);
+    dev_found_.SetH2D(DFLAG_FALSE);
+
+    const index_t nnodes = nnodes_;
+    auto matching_v = dev_matching_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+
+    enode_queue_.Clear();
+    enode_queue_.PrepareForAppendingENode1();
+    // Exposed nodes start trees; matched nodes keep their tree only if its root
+    // is still exposed.
+    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
+        G_,
+        [=] __device__(vertex_t const& x) {
+      auto matching = matching_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto path_table = path_table_v;
+          if (matching[x] == nnodes) {
+            is_even[x] = 1;
+            tree_roots[x] = x;
+            queue.AppendENode1(x);
+            path_table.ResetNode(x);
+          } else {
+            index_t root = tree_roots[x];
+            if (root == nnodes || matching[root] != nnodes) {
+              is_even[x] = 0;
+              tree_roots[x] = nnodes;
+              path_table.ResetNode(x);
+            }
+          }
+        },
+        *context_);
+    context_->get_context(0)->synchronize();
+
+    enode_queue_.PrepareForAppendingENode2();
+    // Even nodes of the kept trees join the frontier.
+    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
+        G_,
+        [=] __device__(vertex_t const& x) {
+      auto matching = matching_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto path_table = path_table_v;
+          if (matching[x] != nnodes) {
+            index_t root = tree_roots[x];
+            if (root != nnodes && matching[root] == nnodes && is_even[x]) queue.AppendENode2(x);
+          }
+        },
+        *context_);
+    context_->get_context(0)->synchronize();
+  }
+
+  bool FindAndFlipAugmentingPathInAlternatingForest() {
+    ts_phase_ = 0;
+    if (LoadFrontier() == 0) return false;
+    const index_t nnodes = nnodes_;
+    const bool search_stats = SearchStats();
+    const int claim_mode = ClaimMode();
+    const int claim_spin = ClaimSpin();
+    const gacge::task::view_t task_all = task_all_.view(), task_flip = task_flip_.view();
+    auto conflicts_v = dev_conflicts_.DeviceView();
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto locks_v = atomic_locks_tree_.DeviceView();
+    auto found_v = dev_found_.DeviceView();
+
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      const gacge::task::view_t t_all = task_all, t_flip = task_flip;
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto locks = locks_v;
+      auto found = found_v;
+      index_t root_v = tree_roots[v];
+      index_t root_w = tree_roots[w];
+      if (is_even[w] && root_v != root_w && root_v != nnodes && root_w != nnodes) {
+        index_t first_lock = MIN(root_v, root_w);
+        index_t second_lock = MAX(root_v, root_w);
+        auto claim = [&]() {
+          if (claim_mode == 0) {  // XB-GAP's protocol
+            if (!TryClaimDAtomicFlag(&locks[first_lock])) return;  // XB-GAP's TryClaim, lower root first
+            if (!TryClaimDAtomicFlag(&locks[second_lock])) {
+              atomicExch(&locks[first_lock], DFLAG_FALSE);  // XB-GAP's release (an atomic store)
+              if (search_stats) atomicAdd(&conflicts_v, 1ULL);
+              return;
+            }
+          } else {  // tentative claims (types_gpu.h): wait out a tentative holder of the first tree,
+                    // and of the second too in mode 2 (the wait chain is increasing in root id)
+            if (!ClaimTreeWait(&locks[first_lock], claim_spin)) return;
+            const bool second = claim_mode == 2 ? ClaimTreeWait(&locks[second_lock], claim_spin)
+                                                : TryClaimDAtomicFlag(&locks[second_lock]);
+            if (!second) {
+              atomicExch(&locks[first_lock], DFLAG_FALSE);
+              if (search_stats) atomicAdd(&conflicts_v, 1ULL);
+              return;
+            }
+            atomicExch(&locks[first_lock], DFLAG_COMMITTED);
+            atomicExch(&locks[second_lock], DFLAG_COMMITTED);
+          }
+          path_table.AddAugmentingPath(v, w, matching);
+          atomicExch(&found, DFLAG_TRUE);
+          if constexpr (kTuple) {  // task: an augmenting edge, its check and its flips
+            gacge::task::record(t_all, 1 + path_table.LastSteps());
+            gacge::task::record(t_flip, 1 + path_table.LastSteps());
+          }
+        };
+        claim();
+      }
+      return false;
+    });
+    found_ = dev_found_.GetD2H();
+    return found_;
+  }
+
+  void ExpandAlternatingForest() {
+    ts_phase_ = 1;
+    if (enode_queue_.Size() == 0) return;
+    LoadFrontier();
+    const index_t nnodes = nnodes_;
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto locks_v = atomic_locks_match_.DeviceView();
+
+    enode_queue_.PrepareForAppendingENode1();
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
+      index_t root_v = tree_roots[v];
+      index_t root_w = tree_roots[w];
+      if (root_w == nnodes) {
+        index_t x = matching[w];
+        index_t match_idx = MIN(w, x);
+        if (TryClaimDAtomicFlag(&locks[match_idx])) {  // XB-GAP's TryClaim
+          is_even[w] = 0;
+          is_even[x] = 1;
+          tree_roots[w] = root_v;
+          tree_roots[x] = root_v;
+          __threadfence();
+          path_table.ExpandTwoNodes(v, w, x);
+          __threadfence();
+          queue.AppendENode1Warp(x);
+        }
+      }
+      __threadfence();
+      return false;
+    });
+  }
+
+  // The blossom lists hold odd_node_ratio x n entries; the prefix sum over them
+  // needs one more. Past that the run is invalid: stop with an error.
+  void CheckListFits(size_t used, const char* what) const {
+    if (used + 1 > num_odd_nodes_in_blossom_list_.size()) {
+      std::fprintf(stderr, "XBError: blossom list full (%zu %ss, capacity %zu); raise -o\n", used, what,
+                   num_odd_nodes_in_blossom_list_.size() - 1);
+      std::exit(4);
+    }
+  }
+
+  void TransformOddNodesInBlossom() {
+    ts_phase_ = 2;
+    if (enode_queue_.Size() == 0) return;
+    LoadFrontier();
+    const index_t nnodes = nnodes_;
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    if constexpr (kTuple) path_table_v.lanes_ = gacge::task::enabled();  // the walks' lane counts
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto locks_v = atomic_locks_odd_nodes_.DeviceView();
+
+    enode_queue_.PrepareForAppendingENode2();
+    path_table_.ResetBlossomBuffer();
+
+    blossom_offset_list_.Clear();
+    auto blossom_offsets_v = blossom_offset_list_.DeviceView();
+    auto nodes_in_blossom_v = num_nodes_in_blossom_list_.DeviceView();
+    auto odd_in_blossom_v = num_odd_nodes_in_blossom_list_.DeviceView();
+    auto odd_vside_in_blossom_v = num_odd_nodes_vside_in_blossom_list_.DeviceView();
+
+    if (nomat_) {
+      // nomat: find the base, claim the odd nodes still odd on both chains
+      // (the lists hold: node, s, o, base), no cycle written
+      const bool count = count_;
+      if (count) dev_blossoms_.SetH2D(0);
+      auto blossoms_v = dev_blossoms_.DeviceView();
+      const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view(),
+                                task_step = task_step_.view(), lane_op = lane_op_.view(), lane_loop = lane_loop_.view();
+      const unsigned long long fe_before = task_fe_;
+      auto blossom_op = [=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> unsigned long long {
+        const gacge::task::view_t t_all = task_all, t_walk = task_walk, t_step = task_step, l_op = lane_op,
+                                  l_loop = lane_loop;
+        unsigned long long lane_entry[2] = {0, 0}, lane_close[2] = {0, 0};
+        if (l_op.cnt) zblossom::dev::TuplePathTableView::LaneTick(lane_entry);
+        auto matching = matching_v;
+        auto path_table = path_table_v;
+        auto is_even = is_even_v;
+        auto tree_roots = tree_roots_v;
+        auto locks = locks_v;
+        auto task_node = blossom_offsets_v;
+        auto task_s = nodes_in_blossom_v;
+        auto task_o = odd_vside_in_blossom_v;
+        auto task_base = odd_in_blossom_v;
+        unsigned long long work = 1;  // the check; a closing edge adds its walk
+        index_t root_v = tree_roots[v];
+        index_t root_w = tree_roots[w];
+        if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
+          if (l_op.cnt) zblossom::dev::TuplePathTableView::LaneTick(lane_close);
+          index_t base;
+          path_table.FindBlossomBaseByAnchorNode(v, w, base);
+          unsigned long long len = 1;  // task: a closing edge, its check, base walk and two chain scans
+          if constexpr (kTuple) len += path_table.LastSteps();
+          if (count) atomicAdd(&blossoms_v, 1ULL);
+          ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, v, w, base);
+          if constexpr (kTuple) len += path_table.LastSteps();
+          ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, w, v, base);
+          if constexpr (kTuple) {
+            len += path_table.LastSteps();
+            work = len;
+            gacge::task::record(t_all, len);
+            gacge::task::record(t_walk, len);
+            gacge::task::record(t_step, len - 1);  // this step's walk: base walk + the two chain scans
+          }
+        }
+        if constexpr (kTuple) {
+          if (l_op.cnt) {
+            gacge::task::count(l_op, 0, lane_entry[0]);
+            gacge::task::count(l_op, 1, lane_entry[1]);
+            gacge::task::count(l_op, 2, lane_close[0]);
+            gacge::task::count(l_op, 3, lane_close[1]);
+            gacge::task::count(l_loop, 0, path_table.lane_walk_[0]);
+            gacge::task::count(l_loop, 1, path_table.lane_walk_[1]);
+            gacge::task::count(l_loop, 2, path_table.lane_chain_[0]);
+            gacge::task::count(l_loop, 3, path_table.lane_chain_[1]);
+          }
+        }
+        return work;
+      };
+      if (gacge::task::enabled())
+        AdvanceCount(blossom_op, task_thr_.view());
+      else
+        Advance(blossom_op);
+      if (count) blossoms_ += dev_blossoms_.GetD2H();
+      if (gacge::task::enabled()) {  // one line per blossom step: its frontier edges, the closing ones' walks
+        const unsigned long long fe = task_fe_ - fe_before, closing = task_step_.tasks();
+        task_step_.add(fe > closing ? fe - closing : 0ULL, 0);  // the other edges: no walk
+        task_step_.print("X-Blossom", "blossom-step",
+                         "step=" + std::to_string(blossom_step_) + " frontier_e=" + std::to_string(fe) +
+                             " closing=" + std::to_string(closing));
+        task_thr_.print("X-Blossom", "thread-blossom-step", "step=" + std::to_string(blossom_step_));
+        lane_op_.print("X-Blossom", "lanes-op", "step=" + std::to_string(blossom_step_));
+        lane_loop_.print("X-Blossom", "lanes-loop", "step=" + std::to_string(blossom_step_));
+        blossom_step_++;
+      }
+      const size_t num_tasks = blossom_offset_list_.size();
+      CheckListFits(num_tasks, "odd-node task");
+      peak_list_ = std::max(peak_list_, num_tasks);
+      if (num_tasks == 0) return;
+      // one task per claimed odd node: its path around the cycle, from the path table
+      LaunchKernelForEachMax(cuda_stream_, num_tasks, [=] __device__(index_t t) {
+        auto path_table = path_table_v;
+        auto is_even = is_even_v;
+        auto queue = queue_v;
+        auto task_node = blossom_offsets_v;
+        auto task_s = nodes_in_blossom_v;
+        auto task_o = odd_vside_in_blossom_v;
+        auto task_base = odd_in_blossom_v;
+        const index_t u = task_node[t];
+        const index_t s = task_s[t];
+        const index_t o = task_o[t];
+        const index_t base = task_base[t];
+        path_table.ExpandOddNodeAroundBlossom(u, s, o, base);
+        atomicExch(&is_even[u], 1);
+        queue.AppendENode2(u);
+      });
+      return;
+    }
+
+    // mat (as is): find the blossoms closed by frontier edges, each materialised in the blossom buffer
+    const bool base_rootpath = base_rootpath_;
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
+      auto blossom_offsets = blossom_offsets_v;
+      auto nodes_in_blossom = nodes_in_blossom_v;
+      auto odd_in_blossom = odd_in_blossom_v;
+      auto odd_vside_in_blossom = odd_vside_in_blossom_v;
+      const bool rootpath = base_rootpath; // captured here: nvcc rejects a first capture inside if constexpr
+      index_t root_v = tree_roots[v];
+      index_t root_w = tree_roots[w];
+      if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
+        offset_t blossom_offset;
+        size_t nnodes_in_blossom;
+        index_t v_idx_in_blossom;
+        if constexpr (kTuple) {
+          if (!path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom))
+            return false; // the cycle buffer is full; the host aborts the run after this kernel
+        } else if (rootpath) {
+          index_t w_idx_in_blossom;
+          if (!path_table.FindBlossomInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom, v_idx_in_blossom,
+                                                     w_idx_in_blossom))
+            return false; // the buffer is full (flagged) or the forest changed under the worker
+        } else {
+          if (!path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
+                                                                              v_idx_in_blossom))
+            return false;
+        }
+        size_t num_odd_vside = v_idx_in_blossom >> 1;
+        size_t num_odd = (nnodes_in_blossom - 2) >> 1;
+        if (num_odd == 0) return false;
+        offset_t slot = blossom_offsets.Append(blossom_offset);
+        if (static_cast<size_t>(slot) >= blossom_offsets.capacity()) return false; // full; the host stops the run
+        nodes_in_blossom[slot] = nnodes_in_blossom;
+        odd_in_blossom[slot] = num_odd;
+        odd_vside_in_blossom[slot] = num_odd_vside;
+      }
+      return false;
+    });
+
+    // Make their odd nodes even (one tasklet per odd node).
+    CheckListFits(blossom_offset_list_.size(), "closing-edge record");
+    if (path_table_.CycleOverflow()) {
+      // the reserve counter kept counting past the capacity: what this step alone asked for
+      const size_t asked = path_table_.BlossomBufferUsed();
+      std::fprintf(stderr, "XBError: cycle buffer full: this step asked for %zu nodes (%.1f GB), capacity %zu nodes (%.1f GB); raise -p\n",
+                   asked, asked * 4e-9, path_table_.BufferCapacity(), path_table_.BufferCapacity() * 4e-9);
+      std::exit(4);
+    }
+    const size_t num_blossom = blossom_offset_list_.size();
+    if (count_) blossoms_ += num_blossom;
+    peak_list_ = std::max(peak_list_, num_blossom);
+    peak_buffer_ = std::max(peak_buffer_, path_table_.BlossomBufferUsed());
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(thrust::raw_pointer_cast(scan_temp_.data()), scan_temp_bytes_,
+                                             num_odd_nodes_in_blossom_list_.begin(),
+                                             num_odd_nodes_in_blossom_psum_.begin(),
+                                             static_cast<int>(num_blossom + 1), cuda_stream_.cuda_stream()));
+    cuda_stream_.Sync();
+    const size_t total_transforms = num_odd_nodes_in_blossom_psum_[num_blossom];
+    peak_tasks_ = std::max(peak_tasks_, total_transforms);
+    if (total_transforms == 0) return;
+    auto psum_v = num_odd_nodes_in_blossom_psum_.DeviceView();
+    LaunchKernelForEachMax(cuda_stream_, total_transforms, [=] __device__(size_t tid) {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
+      auto blossom_offsets = blossom_offsets_v;
+      auto nodes_in_blossom = nodes_in_blossom_v;
+      auto odd_in_blossom = odd_in_blossom_v;
+      auto odd_vside_in_blossom = odd_vside_in_blossom_v;
+      auto psum = psum_v;
+      index_t b = FindRightmostLTEQ64(psum, num_blossom + 1, static_cast<offset_t>(tid));
+      offset_t blossom_offset = blossom_offsets[b];
+      index_t nnodes_in_blossom = nodes_in_blossom[b];
+      index_t num_odd_vside = odd_vside_in_blossom[b];
+      index_t delta = static_cast<index_t>(static_cast<offset_t>(tid) - psum[b]);
+      int is_vside = delta <= (num_odd_vside - 1);
+      index_t odd_idx = 1 + 2 * delta + (1 - is_vside);
+      index_t odd_node;
+      if constexpr (kTuple) {
+        odd_node = path_table.CycleNode(blossom_offset, odd_idx);
+      } else {
+        odd_node = path_table.GetNodeFromBlossomInBlossomBuffer(blossom_offset, odd_idx);
+      }
+      if (!is_even[odd_node] && path_table.IsPathEmpty(odd_node) &&
+          atomicExch(&locks[odd_node], DFLAG_TRUE) == DFLAG_FALSE) {
+        int step = is_vside ? +1 : -1;
+        index_t start_idx = odd_idx + step;
+        size_t path_len = is_vside ? (nnodes_in_blossom - odd_idx - 1) : static_cast<size_t>(odd_idx);
+        if constexpr (kTuple) {
+          if (path_table.CycleSpanHasDuplicate(blossom_offset, start_idx, path_len, step)) return;
+          path_table.ConvertFromCycle(blossom_offset, 2 * num_odd_vside, odd_idx, step);
+        } else {
+          if (path_table.CheckPathDuplicationInBlossomBufferDirectional(blossom_offset, start_idx, path_len, step))
+            return;
+          path_table.ExpandNodesFromBlossomDirectional(odd_node, blossom_offset, nnodes_in_blossom, start_idx,
+                                                       path_len, step);
+        }
+        atomicExch(&is_even[odd_node], 1);
+        queue.AppendENode2(odd_node);
+      }
+    });
+  }
+};
+
+}  // namespace xblossom
+}  // namespace gunrock

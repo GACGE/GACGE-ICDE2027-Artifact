@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Build the CPU implementations: GAP's BFS, SSSP, PageRank (pr_spmv) and TC, and XB-GAP (xblossom), plus
+# bin_to_gap, which converts the binary graphs to GAP's format. Binaries: build/gap/bin/.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+BUILD_DIR="${REPO_DIR}/build"
+TARGETS=(gap)
+
+echo "[BUILD-CPU] Configure the CPU implementations (GAP, XB-GAP) in ${BUILD_DIR}"
+cmake -S "${REPO_DIR}/src" -B "${BUILD_DIR}" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_CPU=ON \
+  -DUSE_GPU=OFF \
+  -DBUILD_APP_GAP=ON \
+  -DBUILD_APP_GUNROCK=OFF
+
+# BUILD_TARGETS (space-separated) builds only those targets (measure/common/build_unit.sh passes a unit's hook/targets).
+if [[ -n "${BUILD_TARGETS:-}" ]]; then read -r -a TARGETS <<< "${BUILD_TARGETS}"; fi
+cmake --build "${BUILD_DIR}" --target "${TARGETS[@]}" --parallel
+echo "[BUILD-CPU] Build Complete"

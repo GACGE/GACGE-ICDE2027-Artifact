@@ -1,0 +1,19 @@
+# built programs and fetched dependencies
+/build/
+/deps/gunrock/
+build_*.log
+# graphs (make datasets, make datasets-syn)
+/data/bin/
+/data/src_nodes/
+/data/xb/
+/data/raw/
+/data/gap/
+/data/r2/
+# measurements and their analysis (make reproduce-*, make results)
+/measure/*/outputs/
+/analysis/*/outputs/
+/results/
+/tmp/
+__pycache__/
+*.pyc
+.DS_Store

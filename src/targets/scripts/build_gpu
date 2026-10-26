@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Build the GPU implementations on Gunrock: BFS, SSSP, PageRank, TC and XB-Gunrock (xblossom).
+# Binaries: build/gunrock/bin/. The stock Gunrock examples are built by measure/gunrock-stock.
+# CUDA_ARCH (default 89, as the paper's builds) sets CMAKE_CUDA_ARCHITECTURES.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+BUILD_DIR="${REPO_DIR}/build"
+TARGETS=(bfs sssp pr tc xblossom)
+
+echo "[BUILD-GPU] Configure the GPU implementations (Gunrock, XB-Gunrock) in ${BUILD_DIR}"
+cmake -S "${REPO_DIR}/src" -B "${BUILD_DIR}" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_CPU=OFF \
+  -DUSE_GPU=ON \
+  -DBUILD_APP_GAP=OFF \
+  -DBUILD_APP_GUNROCK=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH:-89}"
+
+if [[ -n "${BUILD_TARGETS:-}" ]]; then read -r -a TARGETS <<< "${BUILD_TARGETS}"; fi
+cmake --build "${BUILD_DIR}" --target "${TARGETS[@]}" --parallel
+echo "[BUILD-GPU] Build Complete"

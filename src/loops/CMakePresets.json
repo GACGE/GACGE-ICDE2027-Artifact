@@ -1,0 +1,197 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "release-native",
+      "displayName": "Release / native arch (auto-detect host GPU)",
+      "description": "Default preset: builds Release for the GPU(s) present on the build host.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
+      "name": "debug-native",
+      "displayName": "Debug / native arch",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
+      "name": "release-h100",
+      "displayName": "Release / sm_90 only (H100)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "90"
+      }
+    },
+    {
+      "name": "release-a100",
+      "displayName": "Release / sm_80 only (A100)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "80"
+      }
+    },
+    {
+      "name": "release-multi",
+      "displayName": "Release / multi-arch fat binary (Volta..Hopper)",
+      "description": "Builds for sm_70, sm_75, sm_80, sm_86, sm_89, sm_90. Slower compile.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "70;75;80;86;89;90"
+      }
+    },
+    {
+      "name": "release-with-tests",
+      "displayName": "Release / native + tests + benchmarks",
+      "inherits": "release-native",
+      "cacheVariables": {
+        "LOOPS_BUILD_TESTS": "ON",
+        "LOOPS_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "ci-multi-arch",
+      "displayName": "CI / multi-arch, no GPU at build host",
+      "description": "Used by GitHub Actions runners which have nvcc but no GPU. Architectures are limited to Ampere (sm_80) and Hopper (sm_90); CUDA 13 dropped Volta (sm_70) so we omit it for cross-toolkit compatibility. Pre-Ampere coverage lives in `release-multi`.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "80;90"
+      }
+    },
+    {
+      "name": "hip-base",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LOOPS_BACKEND": "HIP"
+      }
+    },
+    {
+      "name": "release-mi210",
+      "displayName": "Release / gfx90a only (MI210 / MI250, CDNA2)",
+      "inherits": "hip-base",
+      "cacheVariables": {
+        "CMAKE_HIP_ARCHITECTURES": "gfx90a"
+      }
+    },
+    {
+      "name": "release-mi300x",
+      "displayName": "Release / gfx942 only (MI300X / MI300A / MI325X, CDNA3)",
+      "inherits": "hip-base",
+      "cacheVariables": {
+        "CMAKE_HIP_ARCHITECTURES": "gfx942"
+      }
+    },
+    {
+      "name": "release-mi350x",
+      "displayName": "Release / gfx950 only (MI350X, CDNA4)",
+      "inherits": "hip-base",
+      "cacheVariables": {
+        "CMAKE_HIP_ARCHITECTURES": "gfx950"
+      }
+    },
+    {
+      "name": "release-rx9070",
+      "displayName": "Release / gfx1201 only (Radeon RX 9070 XT, RDNA4)",
+      "inherits": "hip-base",
+      "cacheVariables": {
+        "CMAKE_HIP_ARCHITECTURES": "gfx1201"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release-native",
+      "configurePreset": "release-native",
+      "jobs": 0
+    },
+    {
+      "name": "debug-native",
+      "configurePreset": "debug-native",
+      "jobs": 0
+    },
+    {
+      "name": "release-h100",
+      "configurePreset": "release-h100",
+      "jobs": 0
+    },
+    {
+      "name": "release-a100",
+      "configurePreset": "release-a100",
+      "jobs": 0
+    },
+    {
+      "name": "release-multi",
+      "configurePreset": "release-multi",
+      "jobs": 0
+    },
+    {
+      "name": "release-with-tests",
+      "configurePreset": "release-with-tests",
+      "jobs": 0
+    },
+    {
+      "name": "ci-multi-arch",
+      "configurePreset": "ci-multi-arch",
+      "description": "Parallelism capped at 2: hosted CI runners (~16 GB) OOM if every Thrust/CUB-heavy nvcc/cicc runs at once across the f32/f64 x multi-arch target set.",
+      "jobs": 2
+    },
+    {
+      "name": "release-mi210",
+      "configurePreset": "release-mi210",
+      "jobs": 0
+    },
+    {
+      "name": "release-mi300x",
+      "configurePreset": "release-mi300x",
+      "jobs": 0
+    },
+    {
+      "name": "release-mi350x",
+      "configurePreset": "release-mi350x",
+      "jobs": 0
+    },
+    {
+      "name": "release-rx9070",
+      "configurePreset": "release-rx9070",
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release-with-tests",
+      "configurePreset": "release-with-tests",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": false
+      }
+    }
+  ]
+}

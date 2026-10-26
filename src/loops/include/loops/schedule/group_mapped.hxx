@@ -1,0 +1,215 @@
+/**
+ * @file group_mapped.hxx
+ * @author Muhammad Osama (mosama@ucdavis.edu)
+ * @brief Group-mapped schedule (map work to tiles, process using individual
+ * threads within the tile.)
+ * @version 0.1
+ * @date 2022-02-04
+ *
+ * @copyright Copyright (c) 2022
+ *
+ */
+
+#pragma once
+
+#include <loops/stride_ranges.hxx>
+#include <loops/container/layout.hxx>
+
+#include <thrust/binary_search.h>
+#include <thrust/execution_policy.h>
+#include <thrust/distance.h>
+
+#ifndef _CG_ABI_EXPERIMENTAL
+#define _CG_ABI_EXPERIMENTAL
+#endif
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/scan.h>
+
+namespace loops {
+namespace schedule {
+
+namespace cg = cooperative_groups;
+#if CUDART_VERSION >= 12000
+namespace cg_x = cg;
+#else
+namespace cg_x = cooperative_groups::experimental;
+#endif
+
+template <std::size_t THREADS_PER_BLOCK,
+          std::size_t THREADS_PER_TILE,
+          typename tiles_type,
+          typename atoms_type,
+          typename tile_size_type,
+          typename atom_size_type,
+          typename layout_type>
+class setup<algorithms_t::group_mapped,
+            THREADS_PER_BLOCK,
+            THREADS_PER_TILE,
+            tiles_type,
+            atoms_type,
+            tile_size_type,
+            atom_size_type,
+            layout_type> {
+ public:
+  using tiles_t = tiles_type;
+  using atoms_t = atoms_type;
+  using tiles_iterator_t = tiles_t*;
+  using atoms_iterator_t = atoms_t*;
+  using tile_size_t = tile_size_type;
+  using atom_size_t = atom_size_type;
+
+  /// Layout view over the workload (default: CSR; supplied as a template
+  /// parameter to allow ELL/COO/custom layouts).
+  using layout_t = layout_type;
+
+  enum : unsigned int {
+    threads_per_block = THREADS_PER_BLOCK,
+    threads_per_tile = THREADS_PER_TILE,
+    tiles_per_block = THREADS_PER_BLOCK / THREADS_PER_TILE,
+  };
+
+  /// Temporary storage buffer for schedule algorithm.
+  struct __align__(32) storage_t {
+#if CUDART_VERSION >= 12000
+    cg_x::block_tile_memory<threads_per_block> groups;
+#else
+    cg_x::block_tile_memory<4, threads_per_block> groups;
+#endif
+    atoms_t tile_aggregates[threads_per_block / threads_per_tile];
+    atoms_t atoms_offsets[threads_per_block];
+    tiles_t tiles_indices[threads_per_block];
+  };
+
+  storage_t& buffer;
+  /// GACGE: >= 0: this block stands in for block `vblock` of the full grid (a capped grid looping grid-stride)
+  long long vblock = -1;
+  __device__ __forceinline__ long long grid_rank() const {
+    return vblock >= 0 ? vblock * (long long)blockDim.x + threadIdx.x : (long long)cg::this_grid().thread_rank();
+  }
+
+  /**
+   * @brief Construct a setup from a CSR-shaped offsets pointer.
+   *
+   * @param _buffer    Scratch storage in shared memory.
+   * @param _tiles     Pointer to the tile-end-offset array (size num_tiles+1).
+   * @param _num_tiles Number of tiles.
+   * @param _num_atoms Total number of atoms.
+   */
+  __device__ __forceinline__ setup(storage_t& _buffer,
+                                   tiles_iterator_t _tiles,
+                                   tile_size_t _num_tiles,
+                                   atom_size_t _num_atoms)
+      : buffer(_buffer), layout_(_tiles, _num_tiles, _num_atoms) {}
+
+  /// Construct directly from a layout view.
+  __device__ __forceinline__ setup(storage_t& _buffer, layout_t _layout)
+      : buffer(_buffer), layout_(_layout) {}
+
+  __device__ __forceinline__ auto partition() {
+    auto b = cg_x::this_thread_block(buffer.groups);
+    auto p = cg_x::tiled_partition<threads_per_tile>(b);
+
+    auto index = grid_rank();
+    auto tile_index = p.thread_rank() + (p.meta_group_rank() * p.size());
+    if (index < layout_.num_tiles()) {
+      buffer.tiles_indices[tile_index] = index;
+    } else {
+      buffer.tiles_indices[tile_index] = -1;
+    }
+    return p;
+  }
+
+  template <typename partition_t>
+  __device__ step_range_t<atoms_t> atom_accessor(partition_t& p) {
+    atoms_t* p_st =
+        buffer.atoms_offsets + (p.meta_group_rank() * threads_per_tile);
+    auto index = grid_rank();
+    atoms_t num_atoms = 0;
+    if (index < layout_.num_tiles()) {
+      num_atoms = layout_.tile_size(static_cast<tiles_t>(index));
+    }
+
+    p_st[p.thread_rank()] = cg::exclusive_scan(p, num_atoms);
+    p.sync();
+
+    if (p.thread_rank() == p.size() - 1) {
+      // Accumulate tiled aggregates.
+      buffer.tile_aggregates[p.meta_group_rank()] =
+          p_st[p.thread_rank()] + num_atoms;
+    }
+
+    p.sync();
+    atoms_t aggregate_atoms = buffer.tile_aggregates[p.meta_group_rank()];
+    return custom_stride_range(atoms_t(p.thread_rank()), aggregate_atoms,
+                               atoms_t(p.size()));
+  }
+
+  template <typename partition_t>
+  __device__ __forceinline__ int get_length(partition_t& p) {
+
+    auto thread_id = grid_rank();
+    auto local_id = p.thread_rank();
+
+    int length = thread_id - local_id + p.size();
+    if (static_cast<int>(layout_.num_tiles()) < length)
+      length = static_cast<int>(layout_.num_tiles());
+
+    length -= thread_id - local_id;
+    return length;
+  }
+
+  template <typename partition_t>
+  __device__ __forceinline__ tiles_t tile_accessor(atoms_t& virtual_atom,
+                                                   partition_t& p) {
+    int length = get_length(p);
+    atoms_t* p_st =
+        buffer.atoms_offsets + (p.meta_group_rank() * threads_per_tile);
+    auto it =
+        thrust::upper_bound(thrust::seq, p_st, p_st + length, virtual_atom);
+    auto x = thrust::distance(p_st, it) - 1;
+    return x;
+  }
+
+  template <typename partition_t>
+  __device__ __forceinline__ bool is_valid_accessor(tiles_t& tile_id,
+                                                    partition_t& p) {
+    return tile_id < get_length(p);
+  }
+
+  template <typename partition_t>
+  __device__ __forceinline__ tiles_t tile_id(tiles_t& v_tile_id,
+                                             partition_t& p) {
+    return buffer.tiles_indices[v_tile_id + (p.meta_group_rank() * p.size())];
+  }
+
+  template <typename partition_t>
+  __device__ __forceinline__ atoms_t atom_id(atoms_t& v_atom,
+                                             tiles_t& tile_id,
+                                             tiles_t& v_tile_id,
+                                             partition_t& p) {
+    atoms_t* p_st =
+        buffer.atoms_offsets + (p.meta_group_rank() * threads_per_tile);
+    return layout_.tile_begin(tile_id) + v_atom - p_st[v_tile_id];
+  }
+
+  /// Direct read access to the underlying layout (advanced use).
+  __host__ __device__ const layout_t& layout() const { return layout_; }
+
+ private:
+  layout_t layout_;
+};
+
+template <std::size_t threads_per_block, typename tiles_t, typename atoms_t>
+using warp_mapped =
+    setup<algorithms_t::group_mapped, threads_per_block, 32, tiles_t, atoms_t>;
+
+template <std::size_t threads_per_block, typename tiles_t, typename atoms_t>
+using block_mapped = setup<algorithms_t::group_mapped,
+                           threads_per_block,
+                           threads_per_block,
+                           tiles_t,
+                           atoms_t>;
+
+}  // namespace schedule
+}  // namespace loops

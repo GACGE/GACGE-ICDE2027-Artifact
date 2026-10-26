@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "bucket": "rt-benchmarks-datasets",
+  "base_url": "https://pub-9b4c630633904be39b04d4e1cee8feeb.r2.dev",
+  "applications": {
+    "bin": {
+      "object": "GACGE/bin_datasets.tar.zst",
+      "compressed_size_bytes": 11016986740,
+      "sha256": "d6d09eafa0271c41d785952b63fd70fb0cea1902e5a33abc63b2ea6c765c8ad9",
+      "extract_directory": "data/bin",
+      "members": [
+        "Amazon",
+        "Arabic",
+        "Google",
+        "HiggsNets",
+        "Hollywood",
+        "Hyperlink",
+        "Kron21",
+        "LiveJournal",
+        "Orkut",
+        "Patent",
+        "Pokec",
+        "Sinaweibo",
+        "StackOverflow",
+        "Twitch",
+        "UK2002",
+        "Webbase",
+        "Wikipedia",
+        "Youtube"
+      ]
+    },
+    "src_nodes": {
+      "object": "GACGE/src_nodes.tar.gz",
+      "compressed_size_bytes": 70491,
+      "sha256": "ed1d58e235effc827198ea697e74f2c8dbb508077e25a33d2e32da42c3ed2406",
+      "extract_directory": "data/src_nodes",
+      "members": [
+        "Amazon_src_nodes.txt",
+        "Arabic_src_nodes.txt",
+        "GPlus_src_nodes.txt",
+        "HiggsNets_src_nodes.txt",
+        "Hollywood_src_nodes.txt",
+        "Hyperlink_src_nodes.txt",
+        "Kron21_src_nodes.txt",
+        "LiveJournal_src_nodes.txt",
+        "Orkut_src_nodes.txt",
+        "Patent_src_nodes.txt",
+        "Pokec_src_nodes.txt",
+        "Sinaweibo_src_nodes.txt",
+        "StackOverflow_src_nodes.txt",
+        "Twitch_src_nodes.txt",
+        "UK2002_src_nodes.txt",
+        "Webbase_src_nodes.txt",
+        "Wikipedia_src_nodes.txt",
+        "Youtube_src_nodes.txt"
+      ]
+    }
+  }
+}

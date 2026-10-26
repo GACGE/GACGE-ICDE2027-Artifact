@@ -1,0 +1,14 @@
+# The paper's figures and tables: where analysis writes each one, its name under results/, and its file in the paper.
+# Columns (tab-separated): paper float, analysis output (under analysis/), results/ name, the file's name in the paper's sources
+Table III	datasets/outputs/tab_graph_metrics_ci.tex	tables/tab03_graph_metrics.tex	tables/tab_graph_metrics_ci.tex
+Table IV	implementations/outputs/tab_blossom_memory.tex	tables/tab04_blossom_memory.tex	tables/tab_blossom_memory.tex
+Sec. V text	implementations/outputs/stock_vs_ours_summary.md	text/sec5_stock_gunrock.md	-
+Figure 4	overall/outputs/plot_runtimes.png	figures/fig04_runtimes.png	figures/pyplots/plot_runtimes.png
+Figure 5	parallelism/outputs/frontier_cpu.png	figures/fig05_frontier_cpu.png	figures/pyplots/frontier_cpu.png
+Figure 6	parallelism/outputs/frontier_xb_phase.png	figures/fig06_frontier_xb_phase.png	figures/pyplots/frontier_xb_phase.png
+Figure 7	parallelism/outputs/plot_parallelism.png	figures/fig07_parallelism.png	figures/pyplots/plot_parallelism.png
+Table V	scaling/outputs/tab_depth_cache.tex	tables/tab05_depth_cache.tex	tables/tab_depth_cache.tex
+Figure 8	scaling/outputs/plot_breadth_depth_merged.png	figures/fig08_breadth_depth.png	figures/pyplots/plot_breadth_depth_merged.png
+Figure 9	scaling/outputs/plot_prefetch.png	figures/fig09_prefetch.png	figures/pyplots/plot_prefetch.png
+Table VI	graph-properties/outputs/tab_syn_evidence.tex	tables/tab06_syn_evidence.tex	tables/tab_syn_evidence.tex
+Figure 10	graph-properties/outputs/plot_syn_parallelism.png	figures/fig10_graph_properties.png	figures/pyplots/plot_syn_parallelism.png
