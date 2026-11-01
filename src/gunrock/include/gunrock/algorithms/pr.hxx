@@ -63,8 +63,8 @@ inline bool pr_gacge() {
 // Default (or GACGE_PR=nr, since 2026-10-16 again): the pull with Gunrock's
 // neighborreduce operator (merge-path, moderngpu's segmented reduce): each
 // edge yields its neighbor's contribution and the segmented reduction sums
-// every vertex's edges, no atomics. Needs the moderngpu fork's midpoint fix
-// (eb98fb0) for graphs over 2^30 edges.
+// every vertex's edges, no atomics. Needs the midpoint fix in deps/vendor's
+// moderngpu for graphs over 2^30 edges.
 inline bool pr_nr() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_PR");
