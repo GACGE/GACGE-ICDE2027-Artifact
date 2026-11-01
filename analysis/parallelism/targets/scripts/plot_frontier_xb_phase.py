@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../common"))
 from units import ANALYSIS, CPU_MACHINE  # noqa: E402
+from figsave import expect_matplotlib  # noqa: E402
+expect_matplotlib("3.8.2")  # the paper's PNG
 
 DATASET = "UK2002"
 RAW = os.path.join(ANALYSIS, "..", "measure", "xb-cpu", "outputs", CPU_MACHINE, "raw", "trace", "Frontier",
@@ -30,7 +32,7 @@ BLUE, RED, INK, MUTED, GRID = "#2a78d6", "#1f1f1e", "#1f1f1e", "#6b6a63", "#e6e4
 # labels in ink, not red; the search's first three steps named above the curve, blossom handling and the
 # augmentation that finds the paths below it (the axes extend below zero to hold them)
 MARK = {287: ("Augment", (285.2, 13.6)), 288: ("Expand", (288.4, 15.9)), 289: ("Blossom", (286.9, -2.4)),
-        290: ("Augment\n(paths found)", (290.6, -2.2)), 291: ("Augment\n(next search)", (292.1, 15.6))}
+        290: ("Augment\n(paths found)", (290.6, -2.2)), 291: ("Augment\n(search restart)", (292.1, 15.6))}
 FIRST, STEPS = 285, 296  # the window, steps FIRST..STEPS (1-based): three searches
 
 steps = {}  # step (1-based) -> (phase, frontier vertices in millions)

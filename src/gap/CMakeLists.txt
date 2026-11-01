@@ -65,4 +65,14 @@ add_custom_command(
     VERBATIM)
 add_custom_target(gap_sync DEPENDS ${GAP_SYNC_OUTPUTS} "${GAP_SYNC_BIN_DIR}/bin_to_gap")
 
-add_custom_target(gap DEPENDS gapbs bin_to_gap)
+# The original X-Blossom CPU implementation (Fan, Lee, Zhang, PVLDB 2025; std::thread), the reference XB-GAP is
+# compared against (measure/xb-cpu XB-Original leg): src/xb-original, built with its own CMake flags
+# (C++14, -O3, -pthread); only its graph reader and per-run report lines are ours (marked GACGE).
+file(GLOB XB_ORIG_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../xb-original/*.cpp")
+add_executable(xblossom_orig ${XB_ORIG_SOURCES})
+target_include_directories(xblossom_orig PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(xblossom_orig PRIVATE -std=c++14 -O3 -pthread)
+target_link_options(xblossom_orig PRIVATE -pthread)
+set_target_properties(xblossom_orig PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${GAP_BIN_DIR}")
+
+add_custom_target(gap DEPENDS gapbs bin_to_gap xblossom_orig)

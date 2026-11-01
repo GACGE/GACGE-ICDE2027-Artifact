@@ -60,8 +60,15 @@ it was copied from.
 | `figures/fig10_graph_properties.png` | Fig. 10, graph size and density |
 
 `make results` alone redoes the analysis from the measurements already in the
-checkout; it needs only `python3` with `matplotlib` and `numpy` (the paper used
-matplotlib 3.11.1 and numpy 2.5.2).
+checkout; it needs only `python3` with `matplotlib`, `numpy` and `pillow`. The
+paper's PNGs of Figs. 5–7 were rendered with matplotlib 3.8.2 and numpy 1.26.4,
+the others with matplotlib 3.11.1 and numpy 2.5.2; other versions draw the same
+data with slightly different text layout. To get the paper's pixels, point
+`PY_MPL382` at a Python with matplotlib 3.8.2 (it defaults to `PY`):
+
+```bash
+make results PY=python3 PY_MPL382=/path/to/python-with-matplotlib-3.8.2
+```
 
 ## Requirements
 

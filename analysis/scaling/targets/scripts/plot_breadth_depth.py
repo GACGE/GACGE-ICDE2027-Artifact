@@ -14,6 +14,8 @@ from matplotlib.lines import Line2D
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../common"))
 from units import leg_runs, mean_ms  # noqa: E402
+from figsave import expect_matplotlib, save_cropped  # noqa: E402
+expect_matplotlib("3.11.1")  # the paper's PNG
 OUTDIR = f"{ROOT}/analysis/scaling/outputs"
 GR = ["Kron21", "Orkut", "UK2002", "Arabic", "Sinaweibo", "Amazon", "HiggsNets", "Youtube"]  # all eight graphs
 if os.environ.get("GRAPHS") == "large":  # the five large graphs only (the paper until 2026-10-24)
@@ -93,5 +95,5 @@ h = [Line2D([], [], color=BLUE, marker="o", markersize=3.2, linewidth=1.1), Line
 axes[0][-1].legend(h, ["CPU breadth", "CPU depth", "GPU breadth", "GPU depth", "breadth | depth"], loc="center left", bbox_to_anchor=(1.03, 0.5),
                    fontsize=5.8, frameon=False, handlelength=1.8, labelspacing=0.35)
 os.makedirs(os.path.dirname(FIG), exist_ok=True)
-fig.savefig(FIG, dpi=600, bbox_inches="tight", pad_inches=0.03)
+save_cropped(fig, FIG, top=9, bottom=18, bbox_inches="tight", pad_inches=0.03)  # the white bands above and below (figsave.py)
 print(FIG)

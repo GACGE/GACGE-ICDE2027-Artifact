@@ -9,6 +9,7 @@ import json
 import math
 import os
 import statistics as st
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -17,6 +18,9 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import MultipleLocator
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
+sys.path.insert(0, f"{ROOT}/analysis/common")
+from figsave import expect_matplotlib, save_cropped  # noqa: E402
+expect_matplotlib("3.11.1")  # the paper's PNG
 CPU = os.environ.get("CPU_MACHINE", "local")
 M = f"{ROOT}/measure"; PNG = f"{ROOT}/analysis/scaling/outputs/plot_prefetch.png"
 P = [("BFS", "bfs", "GAP"), ("SSSP", "sssp", "GAP"), ("XB", "xb", "XB-GAP"), ("PR", "pr", "GAP"), ("TC", "tc", "GAP")]
@@ -63,7 +67,7 @@ ax.legend([Patch(facecolor=ON, edgecolor="black", linewidth=1.0), Patch(facecolo
           borderaxespad=0.2, columnspacing=1.0)
 fig.tight_layout(pad=0.3)
 os.makedirs(os.path.dirname(PNG), exist_ok=True)
-fig.savefig(PNG, dpi=600)
+save_cropped(fig, PNG, top=5, bottom=20)  # the white bands above and below (figsave.py)
 print(PNG)
 for name, *_ in P:
     print(f"{name:4} T_off/T_on GM {gm(sp[name]):.2f} [{min(sp[name]):.2f}-{max(sp[name]):.2f}]")

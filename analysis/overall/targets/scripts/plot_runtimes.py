@@ -18,6 +18,8 @@ from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter  # noqa: 
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../common"))
 from units import *  # noqa: E402,F403
+from figsave import expect_matplotlib, save_cropped  # noqa: E402
+expect_matplotlib("3.11.1")  # the paper's PNG
 
 OUT = os.path.join(ANALYSIS, "overall", "outputs", "plot_runtimes.png")
 NAMES = {"Livejournal": "LiveJournal", "UK2002": "UK-2002"}
@@ -117,7 +119,7 @@ fig.legend([Patch(facecolor=CPU_GM, edgecolor="black", linewidth=EDGE_LW), Patch
            fontsize=7, bbox_to_anchor=(0.5, 0.985), handlelength=1.6, columnspacing=1.6,
            handler_map={tuple: HandlerTuple(ndivide=1, pad=0)})
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
-fig.savefig(OUT, dpi=600, bbox_inches="tight")
+save_cropped(fig, OUT, top=71, bottom=61, bbox_inches="tight")  # the white bands above and below (figsave.py)
 print("->", os.path.abspath(OUT))
 for lab, cpu, gpu, _ in data:
     s = cpu / gpu

@@ -19,6 +19,8 @@ from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter  # noqa: 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "../../../common"))
 from parallelism_lib import gpu_threads, small_share, timing  # noqa: E402
+from figsave import expect_matplotlib  # noqa: E402
+expect_matplotlib("3.8.2")  # the paper's PNG
 
 OUT = os.path.join(HERE, "../../outputs/plot_parallelism.png")
 CPU_THREADS = 96  # every hardware thread of the 48 cores
@@ -64,12 +66,12 @@ a.yaxis.set_major_locator(LogLocator(base=10))
 a.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:g}" if y < 1e3 else f"{y / 1e3:g}K" if y < 1e6 else f"{y / 1e6:g}M"))
 a.yaxis.set_minor_formatter(NullFormatter())
 a.set_xticks(x, names)
-a.set_ylabel("Active threads", fontsize=6.5, fontweight="bold", labelpad=1)
-a.set_title("(a) Active threads", fontsize=6.5, fontweight="bold", pad=3)
+a.set_ylabel("Thread count", fontsize=6.5, fontweight="bold", labelpad=1)
+a.set_title("(a) Thread counts", fontsize=6.5, fontweight="bold", pad=3)
 a.set_xlim(-0.6, len(rows) - 0.25)
 a.grid(axis="y", which="major", linestyle=":", linewidth=0.4, zorder=0)
 a.legend([Patch(facecolor=CPU_FILL, edgecolor="black", hatch=CPU_HATCH, linewidth=0.6),
-          Patch(facecolor=GPU_FILL, edgecolor="black", hatch=GPU_HATCH, linewidth=0.6)], ["CPU", "GPU"],
+          Patch(facecolor=GPU_FILL, edgecolor="black", hatch=GPU_HATCH, linewidth=0.6)], ["CPU workers", "GPU resident threads"],
          loc="upper left", frameon=False, fontsize=5.8, handlelength=1.4, borderaxespad=0.15, labelspacing=0.3)
 
 # (b) small-step share of the GPU's step time

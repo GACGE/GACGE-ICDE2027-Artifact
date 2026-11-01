@@ -32,6 +32,8 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "../../outputs/pl
 sys.path.insert(0, os.path.join(HERE, "../../../common"))
 from graphs import graph_size  # noqa: E402
 from parallelism_lib import gpu_threads, small_share  # noqa: E402
+from figsave import expect_matplotlib, save_cropped  # noqa: E402
+expect_matplotlib("3.11.1")  # the paper's PNG
 
 P = [("BFS", "bfs", "GAP", "Gunrock"), ("SSSP", "sssp", "GAP", "Gunrock"), ("XB", "xb", "XB-GAP", "XB-Gunrock"),
      ("PR", "pr", "GAP", "Gunrock"), ("TC", "tc", "GAP", "Gunrock")]
@@ -125,7 +127,7 @@ else:
 fig.legend(h, lab_, loc="upper center", ncol=4, frameon=False, fontsize=6.6, handlelength=1.6, columnspacing=1.2,
            handletextpad=0.5, bbox_to_anchor=(0.5, 1.0))
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
-fig.savefig(OUT, dpi=600, bbox_inches="tight", pad_inches=0.02)
+save_cropped(fig, OUT, top=23, bottom=13, bbox_inches="tight", pad_inches=0.02)  # the white bands above and below (figsave.py)
 print(OUT)
 for name, u, *_ in P:
     for row, (rlab, names, lab, _) in enumerate(AXES):

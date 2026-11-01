@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../common"))
 from units import ANALYSIS, CPU_MACHINE  # noqa: E402
+from figsave import expect_matplotlib, save_cropped  # noqa: E402
+expect_matplotlib("3.8.2")  # the paper's PNG
 
 MEASURE = os.path.join(ANALYSIS, "..", "measure")
 SLIDE = "--slide" in sys.argv
@@ -88,9 +90,9 @@ for ax, ds in zip(axes.flat, DATASETS):
     ax.grid(True, which="major", color=GRID, lw=0.5)
     ax.tick_params(labelsize=6, pad=1.5)
 for ax in axes[-1, :]:
-    ax.set_xlabel("Step (log)", fontweight="bold")
+    ax.set_xlabel("Execution step", fontweight="bold")
 for ax in axes[:, 0]:
-    ax.set_ylabel("Frontier size (log)", fontweight="bold")
+    ax.set_ylabel("Frontier size", fontweight="bold")
 handles, labels = axes.flat[0].get_legend_handles_labels()
 order = [labels.index(l) for _, l, _ in SERIES]
 if SLIDE:
@@ -101,5 +103,8 @@ else:
                frameon=False, fontsize=7, bbox_to_anchor=(0.5, 1.0), columnspacing=2.0, handlelength=2.2)
 fig.tight_layout(rect=(0, 0, 1, 0.955 if SLIDE else 0.94))
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
-fig.savefig(OUT, dpi=160 if SLIDE else 600, **({"bbox_inches": "tight", "pad_inches": 0.05} if SLIDE else {}))
+if SLIDE:
+    fig.savefig(OUT, dpi=160, bbox_inches="tight", pad_inches=0.05)
+else:
+    save_cropped(fig, OUT, top=34, bottom=75)  # the white bands above and below (figsave.py)
 print("->", os.path.normpath(OUT))

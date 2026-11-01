@@ -5,3 +5,4 @@ ANALYSIS_DIRS += implementations
 analysis-implementations:
 	$(PY) analysis/implementations/targets/scripts/tab_blossom_memory.py
 	$(PY) analysis/implementations/targets/scripts/stock_vs_ours.py
+	$(PY) analysis/implementations/targets/scripts/tab_xb_original.py
