@@ -1,6 +1,7 @@
 # built programs and fetched dependencies
 /build/
 /deps/gunrock/
+/deps/conda/
 build_*.log
 # graphs (make datasets, make datasets-syn)
 /data/bin/

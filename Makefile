@@ -6,6 +6,12 @@
 # from the environment.
 CPU_MACHINE ?= local
 GPU_MACHINE ?= local
+
+# Every Python script runs in the conda environment of make setup-python (deps/conda/envs/gacge) once it exists, and
+# the GPU side uses the CUDA 13.2 toolkit in CUDA_HOME when it is there.
+CONDA_DIR ?= $(CURDIR)/deps/conda
+CUDA_HOME ?= /usr/local/cuda-13.2
+export PATH := $(if $(wildcard $(CONDA_DIR)/envs/gacge/bin/python3),$(CONDA_DIR)/envs/gacge/bin:)$(if $(wildcard $(CUDA_HOME)/bin/nvcc),$(CUDA_HOME)/bin:)$(PATH)
 export CPU_MACHINE GPU_MACHINE
 
 # The root aggregates and does nothing else. Every target is defined by the
