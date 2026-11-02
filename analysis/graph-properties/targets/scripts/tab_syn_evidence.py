@@ -49,6 +49,7 @@ tex = [
     r"% Density excludes S20D4 pending verification of its profiling scope.",
     r"\begin{table}[!t]",
     r"    \centering",
+    r"    \captionsetup{skip=2pt}",
     r"    \caption{CPU load-related stalls, GPU no-issue cycles, and GPU speedup.}",
     r"    \label{tab:syn-evidence}",
     r"    \scriptsize",
@@ -84,9 +85,9 @@ for i, prim in enumerate(("PR", "TC")):
 tex += [
     r"        \bottomrule",
     r"    \end{tabular*}",
-    r"    \par\smallskip",
+    r"    \par\vspace{1pt}",
     r"    \begin{minipage}{0.95\columnwidth}",
-    r"    \raggedright $a \to b$: Size, 0.17M $\to$ 17M vertices; Density, 15 $\to$ 213 edges/vertex. \textit{CPU load-related stalls}: fraction of time waiting for data. \textit{GPU no-issue cycles}: fraction of active GPU scheduler cycles without instruction issue. \textit{GPU speedup}: CPU runtime/GPU runtime at each graph setting.\par",
+    r"    \raggedright $a \to b$: Size, 0.17M $\to$ 17M vertices; Density, 15 $\to$ 213 edges/vertex, excluding the lowest-density graph in Figure~\ref{fig:syn-axes}. \textit{CPU load-related stalls}: fraction of time waiting for data. \textit{GPU no-issue cycles}: fraction of active GPU scheduler cycles without instruction issue. \textit{GPU speedup}: CPU runtime/GPU runtime at each setting.\par",
     r"    \end{minipage}",
     r"\end{table}",
 ]
