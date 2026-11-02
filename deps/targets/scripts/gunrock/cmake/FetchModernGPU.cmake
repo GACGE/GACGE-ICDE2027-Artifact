@@ -9,7 +9,7 @@ set(FETCHCONTENT_BASE_DIR "${FC_BUILD_BASE}")
 FetchContent_Declare(
     moderngpu
     URL            "${CMAKE_CURRENT_LIST_DIR}/../../../../vendor/moderngpu.tar.gz"  # the ModernGPU the paper's builds used
-    URL_HASH       SHA256=e05c6a85048a7c511de8a6056c304f3b5d5031baa4c01a8bb3d79831a016a09a
+    URL_HASH       SHA256=cea85d0c553a155a9af59959c4842e38eca92ae4c4de61365e746a25c13be5dc
     SOURCE_DIR     "${FC_SOURCE_BASE}/moderngpu-src"
     BINARY_DIR     "${FC_BUILD_BASE}/moderngpu-build"
     SUBBUILD_DIR   "${FC_BUILD_BASE}/moderngpu-subbuild"
